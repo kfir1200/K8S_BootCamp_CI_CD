@@ -1,0 +1,134 @@
+name: 'K8S-CI-CD-$(rev:r)'
+
+trigger:
+- main
+
+pool:
+  name: "BootCamp"
+
+variables:
+
+  tag_number: $[counter(variables['BuildDefinitionName'], 1)]
+  tag: "v$(tag_number)"
+  container_registry_name: 'Azure Container Registry'
+  container_repository_name: 'bootcamp-app'
+  enviroment_name: 'BootCampK8S'
+  acr_secret: 'acr-connection-secret'
+  acr_url: 'kfir1200.azurecr.io'
+ 
+stages:
+
+#Continuous Integration Process
+- stage: CI
+  displayName: Build
+  jobs:
+  - job: BuildAndPushDocker
+    workspace: 
+      clean: all
+    steps:
+      - task: Docker@2
+        inputs:
+          containerRegistry: $(container_registry_name)
+          repository: $(container_repository_name)
+          command: 'buildAndPush'
+          Dockerfile: '**/Dockerfile'
+          tags: $(tag)
+
+      - task: PublishPipelineArtifact@1
+        inputs:
+          targetPath: '$(Build.SourcesDirectory)/manifests'
+          artifact: 'manifests'
+          publishLocation: 'pipeline'
+
+# Deploy To AKS
+- stage: Deploy
+  displayName: Deploy to AKS
+  dependsOn: CI
+
+  jobs:
+  - deployment: Deploy
+    displayName: Deploy To AKS
+    environment: 
+      name: $(enviroment_name)
+    pool:
+      name: "BootCamp"
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          
+          - task: DownloadPipelineArtifact@2
+            inputs:
+              buildType: 'current'
+              artifactName: 'manifests'
+              targetPath: '$(Pipeline.Workspace)/manifests'
+          
+          - task: KubernetesManifest@0
+            displayName: create acr connection secret 
+            inputs:
+              action: 'createSecret'
+              kubernetesServiceConnection: 'AKS_Connection'
+              namespace: 'default'
+              secretType: 'dockerRegistry'
+              secretName: '$(acr_secret)'
+              dockerRegistryEndpoint: '$(container_registry_name)'
+
+          - task: replacetokens@5
+            displayName: update tag number in deployment file
+            inputs:
+              rootDirectory: '$(Pipeline.Workspace)/manifests/app'
+              targetFiles: 'deployment.yaml'
+              encoding: 'auto'
+              tokenPattern: 'custom'
+              tokenPrefix: '#'
+              tokenSuffix: '#'
+              writeBOM: false
+              actionOnMissing: 'warn'
+              keepToken: false
+     
+          - task: DownloadSecureFile@1
+            name: app_secret
+            inputs:
+              secureFile: 'app_secret.yaml'
+            displayName: download app secret file 
+
+          - task: DownloadSecureFile@1
+            name: postgres_secret
+            inputs:
+              secureFile: 'postgres_secret.yaml'
+            displayName: download postgres secret file 
+
+          - task: PowerShell@2
+            displayName: deploy weight tracker secret and postgres secret
+            inputs:
+              targetType: 'inline'
+              script: 'kubectl apply -f $(app_secret.secureFilePath) -f $(postgres_secret.secureFilePath)'
+
+          - task: KubernetesManifest@0
+            inputs:
+              action: 'deploy'
+              kubernetesServiceConnection: 'AKS_Connection'
+              namespace: 'default'
+              manifests: '$(Pipeline.Workspace)/manifests/postgres/*'
+            displayName: deploy postgres and services
+          - task: PowerShell@2
+            displayName: deploy application and services
+            inputs:
+              targetType: 'inline'
+              script: 'kubectl apply -f $(Pipeline.Workspace)/manifests/app'
+              arguments: 
+          - task: PowerShell@2
+            displayName: check deployment status
+            inputs:
+              targetType: 'inline'
+              script: |
+                if (!(kubectl rollout status deployment weight-tracker-app))
+                {
+                    kubectl rollout undo deployment weight-tracker-app
+                    kubectl rollout status deployment weight-tracker-app 
+                    exit 1 
+                }
+
+        
+
+        
